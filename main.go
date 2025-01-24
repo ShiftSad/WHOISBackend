@@ -6,10 +6,12 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/likexian/whois"
 	"github.com/likexian/whois-parser"
+	"github.com/patrickmn/go-cache"
 )
 
 type DomainInfo struct {
@@ -18,6 +20,11 @@ type DomainInfo struct {
 	IsLessThan6M bool   `json:"is_less_than_6_months"`
 	Error        string `json:"error,omitempty"`
 }
+
+var (
+	domainCache *cache.Cache
+	mu          sync.Mutex // Protect WHOIS rate limit
+)
 
 // Parse the date from WHOIS data with multiple formats
 func parseCreationDate(dateStr string) (time.Time, error) {
@@ -51,7 +58,19 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if the domain info is cached
+	if cached, found := domainCache.Get(domain); found {
+		// Return the cached result
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cached)
+		return
+	}
+
 	result := DomainInfo{Domain: domain}
+
+	// Mutex lock to ensure WHOIS queries are rate-limited
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Perform WHOIS lookup
 	rawWhois, err := whois.Whois(domain)
@@ -90,14 +109,20 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 	result.CreatedDate = creationTime.Format("2006-01-02")
 	result.IsLessThan6M = creationTime.After(sixMonthsAgo)
 
+	// Cache the result
+	domainCache.Set(domain, result, cache.DefaultExpiration)
+
 	// Return the result as JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
 
 func main() {
+	// Initialize the cache with a default expiration of 24 hours
+	domainCache = cache.New(24*time.Hour, 1*time.Hour)
+
 	http.HandleFunc("/check-domain", checkDomainAge)
 
-	fmt.Println("Server is running on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	fmt.Println("Server is running on http://0.0.0.0:8080")
+	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
