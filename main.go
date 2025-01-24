@@ -23,34 +23,36 @@ type DomainInfo struct {
 
 var (
 	domainCache *cache.Cache
-	mu          sync.Mutex // Protect WHOIS rate limit
+	mu          sync.Mutex
 )
 
-// Parse the date from WHOIS data with multiple formats
-func parseCreationDate(dateStr string) (time.Time, error) {
-	// Remove extra characters if present (e.g., "#22814823")
-	cleanedDate := strings.Fields(dateStr)[0]
-
-	// Try parsing the date in different formats
-	formats := []string{
-		"2006-01-02T15:04:05Z", // ISO 8601
-		"2006-01-02",           // Simple YYYY-MM-DD
-		"20060102",             // Compact YYYYMMDD (e.g., 20210507)
+// Add CORS headers to allow cross-origin requests
+func enableCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*") // Allow requests from any origin
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next(w, r)
 	}
+}
 
-	var parsedTime time.Time
-	var err error
-
+// Parse the date from WHOIS data
+func parseCreationDate(dateStr string) (time.Time, error) {
+	cleanedDate := strings.Fields(dateStr)[0]
+	formats := []string{"2006-01-02T15:04:05Z", "2006-01-02", "20060102"}
 	for _, format := range formats {
-		parsedTime, err = time.Parse(format, cleanedDate)
-		if err == nil {
-			return parsedTime, nil
+		if t, err := time.Parse(format, cleanedDate); err == nil {
+			return t, nil
 		}
 	}
-
 	return time.Time{}, fmt.Errorf("unsupported date format: %s", dateStr)
 }
 
+// Main handler to check domain age
 func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 	domain := r.URL.Query().Get("domain")
 	if domain == "" {
@@ -58,21 +60,15 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if the domain info is cached
 	if cached, found := domainCache.Get(domain); found {
-		// Return the cached result
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cached)
 		return
 	}
 
 	result := DomainInfo{Domain: domain}
-
-	// Mutex lock to ensure WHOIS queries are rate-limited
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Perform WHOIS lookup
 	rawWhois, err := whois.Whois(domain)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to fetch WHOIS: %v", err)
@@ -80,7 +76,6 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the WHOIS data
 	parsedWhois, err := whoisparser.Parse(rawWhois)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to parse WHOIS data: %v", err)
@@ -88,7 +83,6 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract the creation date
 	creationDate := parsedWhois.Domain.CreatedDate
 	if creationDate == "" {
 		result.Error = "Creation date not found in WHOIS data"
@@ -96,7 +90,6 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the creation date using the custom parser
 	creationTime, err := parseCreationDate(creationDate)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to parse creation date: %v", err)
@@ -104,25 +97,19 @@ func checkDomainAge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if the domain is less than 6 months old
 	sixMonthsAgo := time.Now().AddDate(0, -6, 0)
 	result.CreatedDate = creationTime.Format("2006-01-02")
 	result.IsLessThan6M = creationTime.After(sixMonthsAgo)
-
-	// Cache the result
 	domainCache.Set(domain, result, cache.DefaultExpiration)
 
-	// Return the result as JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
 
 func main() {
-	// Initialize the cache with a default expiration of 24 hours
 	domainCache = cache.New(24*time.Hour, 1*time.Hour)
+	http.HandleFunc("/check-domain", enableCORS(checkDomainAge))
 
-	http.HandleFunc("/check-domain", checkDomainAge)
-
-	fmt.Println("Server is running on http://0.0.0.0:8080")
-	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
+	fmt.Println("Server is running")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
